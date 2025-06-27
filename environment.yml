@@ -1,0 +1,13 @@
+# Conda environment for the mhw3d-detection project
+name: mhw3d
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - xarray
+  - dask
+  - bottleneck
+  - netcdf4
+  - pytest
