@@ -7,7 +7,7 @@ from datetime import date
 # --- Import the reference code from the legacy folder ---
 import sys
 sys.path.append('tests/data/legacy/')
-import mhw as oliver_mhw
+import marineHeatWaves as oliver_mhw
 
 # --- Import YOUR code from the src directory ---
 from mhw3d import bipolarMhwToolBox as ben_mhw
@@ -53,7 +53,9 @@ def test_ben_mhw_against_oliver_synthetic():
 
     # 2. GET EXPECTED RESULT
     # Run the original Oliver code to get the "ground truth" results.
-    expected_events, expected_clim = oliver_mhw.detect(time, temp)
+    # We must convert our datetime64 array to the integer ordinal format the legacy code expects.
+    t_ordinal = np.array([pd.to_datetime(t).to_pydatetime().toordinal() for t in time])
+    expected_events, expected_clim = oliver_mhw.detect(t_ordinal, temp) # Use t_ordinal here
     expected_df = pd.DataFrame(expected_events)
 
     # 3. PREPARE INPUT FOR THE BEN-MHW TOOLBOX
@@ -63,13 +65,16 @@ def test_ben_mhw_against_oliver_synthetic():
     severity = ssta / (expected_clim['thresh'] - expected_clim['seas'])
 
     # Create the xarray Dataset your function needs, with dummy lat/lon coords.
+    # First, create a 1D dataset with only the time dimension.
     ds_input = xr.Dataset(
         data_vars={
             'ssta': (('time',), ssta),
             'severity': (('time',), severity)
         },
-        coords={'time': time, 'lat': [0], 'lon': [0]}
-    ).expand_dims(['lat', 'lon'])
+        coords={'time': time}
+    )
+    # NOW, expand it to be a 3D dataset by adding lat and lon.
+    ds_input = ds_input.expand_dims(['lat', 'lon'])
 
     # 4. RUN YOUR CODE
     ds_actual_events = ben_mhw.calculate_MHWs_metrics(ds_input)
@@ -91,9 +96,17 @@ def test_ben_mhw_against_oliver_synthetic():
     # 6. ASSERT EQUALITY
     # Select only the columns your code calculates for a fair comparison.
     columns_to_compare = actual_df.columns.tolist()
-    expected_df_subset = expected_df[columns_to_compare]
-    
-    # Ensure data types match to avoid false failures.
+    expected_df_subset = expected_df[columns_to_compare].copy() # Use .copy() to avoid warnings
+
+    # --- FIX THE DATA TYPES ---
+    # Convert all date-related columns in both dataframes to the same
+    # pandas datetime format to ensure a fair comparison.
+    date_cols = ['date_start', 'date_end', 'date_peak']
+    for col in date_cols:
+        expected_df_subset[col] = pd.to_datetime(expected_df_subset[col])
+        actual_df[col] = pd.to_datetime(actual_df[col])
+
+    # Also ensure duration types match.
     actual_df['duration'] = actual_df['duration'].astype(float)
     expected_df_subset['duration'] = expected_df_subset['duration'].astype(float)
 
@@ -102,5 +115,5 @@ def test_ben_mhw_against_oliver_synthetic():
         expected_df_subset.reset_index(drop=True),
         actual_df.reset_index(drop=True),
         # Add a tolerance for minor floating point differences
-        check_exact=False, atol=0.01 
+        check_exact=False, atol=0.01
     )

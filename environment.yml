@@ -3,6 +3,7 @@ name: mhw3d
 channels:
   - conda-forge
 dependencies:
+  # Core scientific libraries
   - python=3.10
   - numpy
   - pandas
@@ -10,4 +11,12 @@ dependencies:
   - dask
   - bottleneck
   - netcdf4
+  - scipy
+
+  # Testing
   - pytest
+
+  # Interactive development and plotting
+  - jupyterlab
+  - notebook
+  - proplot
