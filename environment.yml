@@ -5,13 +5,17 @@ channels:
 dependencies:
   # Core scientific libraries
   - python=3.10
+  - dask
+  - netcdf4
   - numpy
   - pandas
-  - xarray
-  - dask
-  - bottleneck
-  - netcdf4
   - scipy
+  - xarray
+
+  # Performance
+  - bottleneck
+  - flox
+  - zarr
 
   # Testing
   - pytest
@@ -19,4 +23,4 @@ dependencies:
   # Interactive development and plotting
   - jupyterlab
   - notebook
-  - proplot
+  - ultraplot # proplot deprecated

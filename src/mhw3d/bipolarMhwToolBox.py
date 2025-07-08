@@ -1,5 +1,4 @@
 import xarray as xr
-import proplot as pplt
 import numpy as np
 import datetime as dt
 import bottleneck as bn
@@ -205,14 +204,20 @@ def smoothedClima_mhw(ds):
     ds_smoothedClim = tmpSmooClim.rename({'time':'dayofyear'}).assign_coords(dayofyear=ds_clim_doy.dayofyear.data)
     return ds_smoothedClim
 
-def smoothedThresh_mhw(ds, pctile=0.9):
+def smoothedThresh_mhw(ds, pctile=0.9, windowHalfWidth=5, smoothPercentile=True, smoothPercentileWidth=31):
     """
     Replicate the threshold calculation used in the marineHeatWave.py algorithm.
     Note this code is unlikely to work if there are NaNs.
     Input:
         - ds: xr.Dataset containing (at least) `time` (as np.datetime64 format) and any variable over 
               which the climatology should be calculated (e.g. SST, ice concentration, etc.)
-        - pctile: the percentile to use for the threshold calculation (default=0.9).
+        - pctile: Threshold percentile (%) for detection of extreme values (default=0.9).
+        - windowHalfWidth: Width of window (one sided) about day-of-year used for the pooling of values
+                           and calculation of threshold percentile (default = 5 [days])
+        - smoothPercentile: Boolean switch indicating whether to smooth the threshold percentile timeseries
+                            with a moving average (default = True)
+        - smoothPercentileWidth: Width of moving average window for smoothing threshold (default = 31 days)
+
     Output:
         - ds_smoothedClim: a xr.Dataset of same size as ds, except for the `time` dimension that became a 
         `dayofyear` dimension of size 366. This dataset contains the threshold, as a percentile, to detect
@@ -224,25 +229,49 @@ def smoothedThresh_mhw(ds, pctile=0.9):
     if ~np.isin("time",ds.dims):
         print("No 'time' dimensions in the dataset")
         return
-    # Calculate a rolling mean first, with a 11 days window.
+    # Generate an empty DataArray to store the threshold results
+    ## TODO: Adapt this to any kind of input array, including 3D dataset. Maybe use xr.zeros_like(ds)?
     thresh = xr.DataArray(dims=["lat", "lon", "doy"],
                           coords={'lon':("lon", ds.lon.data),
                                   'lat':("lat", ds.lat.data),
                                   'doy': ("doy", np.arange(1,366+1))})
+    # Convert time into dayofyear (doy)
     doy = ds.time.dt.dayofyear
+    # ======= DEVELOPING COMMENTS =========================
+    # 1. Quantile loop: this is likely a major bottleneck in the script. 
+    # Tests showed that the quantile function is the step taking most time in the whole process. Replacing would help.
+    # 2. Also, the use of the for loop is of course not ideal. There might be ways to use some convolution to speed up the process.
+    # This would require some proper thinking. 
+    # 3. Another thing is that the loop is poorly constructed at the moment, with tt=1 coresponding actually at doy=6 by construction
+    # It would be better to adjust by maybe using a condition like:
+    # `ds.where((doy >= tt - windowHalfWidth) & (doy < tt + windowHalfWidth + 1)`
+    # There might also be room for avoiding the if condition if I consistently use modulos for both sides of the condition.
+    # But I am not sure about that, I think leap years are again messing everything up.
+    # ============= BR, 02/07/2025 ========================
+    windowFullWidth = windowHalfWidth * 2 + 1
+    # Now loop over the doy of a climatological year
     for tt in np.arange(1,366+1):
-        if tt < 366-11:
-            ds_window = ds.where((doy>=tt) & (doy<tt+11),drop=True)
-        else:
-            ds_window = ds.where((doy>=tt) | (doy<(tt+11)%365),drop=True)
+        if tt < 366 - windowFullWidth: # If the window is entirely below 366
+            # Get the window normally, removing all values outside the time-window
+            ds_window = ds.where((doy >= tt) & (doy < tt + windowFullWidth),drop=True)
+        else: # If the window includes days above 366
+            # Use modulo to wrap around the 1st of January and remove all values outside the time-window
+            ds_window = ds.where((doy >= tt) | (doy < (tt + windowFullWidth)%365),drop=True)
+        # Now, calculate the percentile for this window, for all years.
+        ## TODO: skipna=False is supposed to speed things up dramatically, but is not adapted to irregular time series.
+        # Need to adapt this depending on whether there are nans, maybe through user-provided argument?
         qt = ds_window.quantile(pctile,dim='time',skipna=False)
-        thresh.loc[{'doy':thresh.doy==tt}] = qt.drop('quantile').expand_dims('doy',axis=-1)
-    stackedThresh = xr.concat([thresh,thresh,thresh],dim='year').stack(time={'year','doy'}).roll(time=5)
-    # Smooth the time series
-    smoothedThresh = stackedThresh.rolling(time=31, 
-                                       min_periods=1,
-                                       center=True).mean()
-    # Restrain the middle year and rearrange the dimensions to only keep "dayofyear"
-    SmoothThresh = smoothedThresh.where(smoothedThresh.year==1,
-                                        drop=True).drop('year').rename({'time':'dayofyear'})
+        # Add the percentile to the treshold array for that specific doy
+        thresh.loc[{'doy':thresh.doy==tt}] = qt.drop_vars('quantile').expand_dims('doy',axis=-1)
+    # Because of the way the loop is constructed, the index tt=1 actually corresponds to the percentile of doy=6.
+    # So need to roll this by 5 days to align properly. NOTE: Might be able to remove this by modifying the loop.
+    thresh = thresh.roll(doy=windowHalfWidth)
+    # Now, to smooth everything, need to concatenate 3 years so that boundaries are accounted for.
+    if smoothPercentile:
+        stackedThresh = xr.concat([thresh,thresh,thresh],dim='year').stack(time={'year','doy'})
+        # Smooth the time series by using a rolling average.
+        smoothedThresh = stackedThresh.rolling(time=31, min_periods=1, center=True).mean()
+        # Extract the middle year and rearrange the dimensions to only keep "dayofyear"
+        # SmoothThresh = smoothedThresh.where(smoothedThresh.year==1, drop=True).drop('year').rename({'time':'dayofyear'}) # Old method
+        SmoothThresh = smoothedThresh.sel(year=1).drop_vars('year').rename({'doy':'dayofyear'}) # This seems to work as well if not better.
     return SmoothThresh
