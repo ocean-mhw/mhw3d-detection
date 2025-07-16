@@ -174,34 +174,35 @@ def smoothedClima_mhw(ds):
     """
     Replicate the climatology calculation used in the marineHeatWave.py algorithm.
     Input:
-        - ds: xr.Dataset containing (at least) `time` (as np.datetime64 format) and any variable over 
-              which the climatology should be calculated (e.g. SST, ice concentration, etc.)
+        - ds: xr.DataArray containing the temperature time series.
     Output:
-        - SmoothThresh: a xr.Dataset of same size as ds, except for the `time` dimension that became a 
-        `dayofyear` dimension of size 366. This dataset contains
-        
-    Note that contrarily to the marineheatwave algorithm, the 366th day is not inserted on 
-    the 29th of February via interpolation but is calculated as the other days and is inserted on
-    the 31st of December. This subtlety is arising from the handling of dayofyear by xarray (or rather pandas,
-    used internally). On leap years, 31st of December is doy 366, while on non-leap years, it is doy 365.
+        - ds_smoothedClim: a xr.DataArray of same size as ds, except for the `time` dimension that became a
+        `dayofyear` dimension of size 366. This dataset contains the smoothed seasonal cycle.
     """
-    if ~np.isin("time",ds.dims):
+    if "time" not in ds.dims:
         print("No 'time' dimensions in the dataset")
         return
-    # Calculate a rolling mean first, with a 11 days window. 
-    ds_rolled = ds.rolling(time=11, min_periods=1, center=True).mean()
-    # Calculate the mean over dayofyear
-    ds_clim_doy = ds_rolled.groupby("time.dayofyear").mean()
-    # If I just smooth over that, my beginning and end will be weird.
-    # A solution is to replicate 3 times, do the running average, and get the middle year.
-    stackedClim = xr.concat([ds_clim_doy,ds_clim_doy,ds_clim_doy],dim='year').stack(time={'year','dayofyear'})
+
+    # Remove the preliminary 11-day smoothing to match the Oliver method.
+    ds_clim_doy = ds.groupby("time.dayofyear").mean()
+
+    # Stack 3 years of the climatology together for seamless smoothing.
+    # Note: .stack() creates coordinates from the multi-index names ('year', 'dayofyear').
+    stackedClim = xr.concat([ds_clim_doy, ds_clim_doy, ds_clim_doy], dim='year').stack(time={'year','dayofyear'})
+
+    # --- MODIFICATION: Use the correct coordinate name for sorting ---
+    # The coordinate is named 'dayofyear', not 'doy'.
+    stackedClim = stackedClim.sortby(['year', 'dayofyear'])
+
     # Smooth the time series
     smoothedClim = stackedClim.rolling(time=31,
                                        min_periods=1,
                                        center=True).mean()
+
     # Extract the middle year and rearrange the dimensions to only keep "dayofyear"
-    tmpSmooClim = smoothedClim.where(smoothedClim.year==1,drop=True).drop('year')
+    tmpSmooClim = smoothedClim.where(smoothedClim.year==1, drop=True).drop_vars('year')
     ds_smoothedClim = tmpSmooClim.rename({'time':'dayofyear'}).assign_coords(dayofyear=ds_clim_doy.dayofyear.data)
+    
     return ds_smoothedClim
 
 def smoothedThresh_mhw(ds, pctile=0.9, windowHalfWidth=5, smoothPercentile=True, smoothPercentileWidth=31):
@@ -268,7 +269,7 @@ def smoothedThresh_mhw(ds, pctile=0.9, windowHalfWidth=5, smoothPercentile=True,
     thresh = thresh.roll(doy=windowHalfWidth)
     # Now, to smooth everything, need to concatenate 3 years so that boundaries are accounted for.
     if smoothPercentile:
-        stackedThresh = xr.concat([thresh,thresh,thresh],dim='year').stack(time={'year','doy'})
+        stackedThresh = xr.concat([thresh,thresh,thresh],dim='year').stack(time={'year','doy'}).sortby(['year', 'doy']) # added .sortby command 
         # Smooth the time series by using a rolling average.
         smoothedThresh = stackedThresh.rolling(time=31, min_periods=1, center=True).mean()
         # Extract the middle year and rearrange the dimensions to only keep "dayofyear"
