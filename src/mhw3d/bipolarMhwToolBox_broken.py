@@ -1,0 +1,243 @@
+import xarray as xr
+import numpy as np
+import datetime as dt
+import bottleneck as bn
+#import marineHeatWaves as mhw
+import pandas as pd
+from pathlib import Path
+
+def detectMHWs_fromSeverity(time, ts_severity, l_return=200, minDuration=5, maxGap=2):
+    """
+    Adapt the marineheatwaves function from Eric to work on the severity. 
+    This function is called in a apply_ufunc call, so that it can be parallelized.
+    Identify the presence, start and end dates of the mhw on each grid cell.
+    The rest of the metrics are calculated using the function `add_metrics_MHWs`.
+    Inputs: 
+        - time: np.datetime64 vector
+        - ts_severity: Severity = SSTa/(Thresh - Seas). (as a vector)
+        - l_return: the maximum number of expected MHW events (to pre-allocate the output).
+        - minDuration and maxGap: definition-specific parameters.
+    Output: 
+        - Numpy array with the following variables: index_start, index_end, date_start, date_end, duration.
+          It needs to be a numpy array, because of the apply_ufunc call.
+    """
+    # Create boolean where severity indicates a potential MHWs
+    t = time
+    boolSever = ts_severity > 1
+    # Preallocate the mhw dictionary
+    mhw = {}
+    mhw['index_start'] = np.empty(l_return) * np.nan
+    mhw['index_end'] = np.empty(l_return) * np.nan
+    mhw['date_start'] = np.empty(l_return) * np.nan
+    mhw['date_end'] = np.empty(l_return) * np.nan
+    mhw['duration'] = np.empty(l_return) * np.nan
+    # Convert to a np.array for vectorization
+    ia = np.asarray(boolSever)                # force numpy
+    n = len(ia)       # Length of the array, along time dim
+    if ~np.isnan(ia).all(): # Make sure it is not a nan array
+        # This a very neat and smart way to find consecutive repetitions
+        # Combined with some stackoverflow stuff.
+        y = ia[1:] != ia[:-1]               # pairwise unequal (string safe)
+        i = np.append(np.where(y), n - 1)   # must include last element posi
+        l_cont = np.diff(np.append(-1, i))       # run lengths
+        p = np.append(0,i+1)[:-1]  #np.cumsum(np.append(0, l_cont))[:-1] # positions
+        type = ia[i]
+        # Filter for mhws (longer than 5 days, and severity >=1)
+        b_mhw = np.where((l_cont >= minDuration) & (type == 1))[0]
+        # Extract the first index and the last index of each MHW
+        i_start = p[b_mhw]
+        i_end = i[b_mhw]
+        # Find if gap after mhw is less than 2days and include in mhw if so
+        l_gap = i_start[1:] - i_end[:-1] - 1
+        boolGap = l_gap <= maxGap
+        if any(boolGap):
+            indGap = np.where(boolGap)[0]
+            ibeg_mhw = np.delete(i_start,indGap+1)
+            iend_mhw = np.delete(i_end,indGap)
+        else:
+            ibeg_mhw = i_start
+            iend_mhw = i_end
+        # Now can take care of including more stuff in the dictionary
+        n_events = len(ibeg_mhw)
+        mhw['index_start'][:n_events] = ibeg_mhw
+        mhw['index_end'][:n_events] = iend_mhw
+        mhw['date_start'][:n_events] = t[ibeg_mhw]
+        mhw['date_end'][:n_events] = t[iend_mhw]
+        mhw['duration'][:n_events] = iend_mhw - ibeg_mhw + 1
+    # Need to return a dataset
+    ds_mhw = xr.Dataset({var: ('event', data) for var, data in mhw.items()},
+                        coords={'event':('event',range(l_return))})
+    return ds_mhw.to_array()
+
+def add_metrics_MHWs(time, ssta, date_start, date_end, l_return=200):
+    """
+    Calculate more metrics, such as peak date and intensities.  Could add more in this function.
+    This function is also called in an apply_ufunc call, to parallelize things.
+    Inputs:
+        - time: a np.datetime64 vector
+        - ssta: sea surface temperature anomaly (vector)
+        - date_start: np.datetime64 vector containing the start date of all detected MHW events (for this one ssta)
+        - date_end: np.datetime64 vector containing the end date of all detected MHW events (for this one ssta)
+        - l_return: the maximum number of expected MHW events (to pre-allocate the output).
+    Output:
+        - Numpy array containing more metrics, including peak date and various intensities.
+    """
+    # Force numpy arrays
+    time_np = time                # time
+    ssta_np = np.asarray(ssta)                # ssta
+    date_start_np = np.asarray(date_start)    # date_start
+    date_end_np = np.asarray(date_end)        # date_end
+    # Make sure it is only 2D, i.e. only one grid cell.
+    if len(ssta_np.shape)>2:
+        print('Dataset has too many dimensions, computation will be too heavy and crash.')
+        print('Try to vectorize or loop over grid cells.')
+        return
+    # Start a new dictionary
+    mhw_out = {}
+    mhw_out['index_peak'] = np.empty(l_return) * np.nan
+    mhw_out['date_peak'] = np.empty(l_return) * np.nan
+    mhw_out['intensity_max'] = np.empty(l_return) * np.nan
+    mhw_out['intensity_mean'] = np.empty(l_return) * np.nan
+    mhw_out['intensity_cumul'] = np.empty(l_return) * np.nan
+    if ~np.isnan(ssta_np).all(): # Make sure it is not a nan array
+        boolnan = ~np.isnan(date_start_np)
+        dstart = date_start_np[boolnan]
+        dend = date_end_np[boolnan]
+        # For each event, create a time series of ssta with all values out of MHWs naned-out
+        np_ssta_evts = np.where((time_np[:, np.newaxis]>=dstart) & (time_np[:, np.newaxis]<=dend),
+                                ssta_np[:, np.newaxis],np.nan)
+        # Use the argmax to extract the ssta maximum during the mhw, then convert to a date
+        n_events = bn.nansum(boolnan)
+        index_peak = bn.nanargmax(np_ssta_evts,axis=0)
+        mhw_out['index_peak'][:n_events] = index_peak
+        date_peak = time_np[index_peak]
+        mhw_out['date_peak'][:n_events] = date_peak
+        # # Now calculate intensities
+        mhw_out['intensity_max'][:n_events] = bn.nanmax(np_ssta_evts,axis=0)
+        mhw_out['intensity_mean'][:n_events] = bn.nanmean(np_ssta_evts,axis=0)
+        mhw_out['intensity_cumul'][:n_events] = bn.nansum(np_ssta_evts,axis=0)
+        # Finally convert to a ds to send back.
+    ds_mhw_out = xr.Dataset({var: ('event', data) for var, data in mhw_out.items()},
+                            coords={'event':('event',range(l_return))})
+    return ds_mhw_out.to_array()
+
+def calculate_MHWs_metrics(ds, maxEvt=200):
+    """
+    Use apply_ufunc to vectorize calculations and use both previous functions onto several grid cells at once.
+    Inputs:
+        - ds: xr.Dataset containing coordinate `time` (np.datetime64 format), and variable `severity`. 
+          It can contain more variables, those will simply be ignored. 
+          It should contain more coordinates (typically lat and lon or x and y if curvi-linear; also depth),
+          else this function is useless and the classic marineheatwaves function might as well be called.
+    Outputs:
+        - ds_mhw_full: an xr.Dataset containing MHW metrics for each grid cell of the input Dataset.
+    """
+    # Detect the marine heatwaves
+    mhw = xr.apply_ufunc(detectMHWs_fromSeverity, ds.time, ds.severity, kwargs={'l_return':maxEvt},
+                         input_core_dims=[['time'],['time']],
+                         output_core_dims=[['variable','event']],
+                         dask="parallelized",
+                         dask_gufunc_kwargs={"output_sizes": {"event": maxEvt, "variable": 5}},
+                         vectorize=True)
+    # mhw = mhw.compute() # Do I need to compute now? Or can I wait?
+    # Convert the output, a DataArray, into a Dataset with variables.
+    ds_mhw = mhw.assign_coords({'variable':('variable',['index_start','index_end','date_start','date_end','duration']),
+                                'event':('event',range(maxEvt))}).to_dataset(dim='variable')
+    # So far, I have padded each grid cell to be able to have a cubic dataset. Drop the extra nan-slices
+    ds_mhw = ds_mhw.dropna('event',how='all') 
+    # Convert the dates from numpy numbers to human-readable dates
+    ds_mhw['date_start'] = ds_mhw.date_start.astype('datetime64[ns]')
+    ds_mhw['date_end'] = ds_mhw.date_end.astype('datetime64[ns]')
+    # Calculate the number of events
+    ds_mhw['n_event'] = ds_mhw.index_start.notnull().sum(dim='event')
+    # Now apply the other function to add some more metrics, using the ssta
+    ds_mhw_more = xr.apply_ufunc(add_metrics_MHWs, ds.time, ds.ssta, 
+                                 ds_mhw.date_start, ds_mhw.date_end, 
+                                 kwargs={'l_return':len(ds_mhw.event)},
+                                 input_core_dims=[['time'],['time'],['event'],['event']],
+                                 output_core_dims=[['variable','event']],
+                                 dask="parallelized",
+                                 dask_gufunc_kwargs={"output_sizes": {"variable": 5, "event": len(ds_mhw.event)}},
+                                 output_dtypes=['float'],
+                                 vectorize=True)
+    # Convert from a dataArray to a Dataset
+    ds_mhw_more = ds_mhw_more.assign_coords({'variable':('variable',
+                                                         ['index_peak','date_peak','intensity_max',
+                                                          'intensity_mean','intensity_cumul']),
+                                             'event':('event',range(len(ds_mhw.event)))}).to_dataset(dim='variable')
+    # Merge both datasets
+    ds_mhw_more['date_peak'] = ds_mhw_more.date_peak.astype('datetime64[ns]')
+    ds_mhw_full = ds_mhw.merge(ds_mhw_more)
+    return ds_mhw_full
+
+def smoothedClima_mhw(ds):
+    """
+    Replicates the climatology calculation used in the marineHeatWave.py algorithm.
+    """
+    if "time" not in ds.dims:
+        print("No 'time' dimensions in the dataset")
+        return
+
+    # Group raw data by day of year
+    ds_clim_doy = ds.groupby("time.dayofyear").mean()
+
+    # Stack 3 years for seamless smoothing
+    stackedClim = xr.concat([ds_clim_doy, ds_clim_doy, ds_clim_doy], dim='year').stack(time={'year', 'dayofyear'})
+    
+    # Sort the stacked data to prevent issues with xarray updates
+    stackedClim = stackedClim.sortby(['year', 'dayofyear'])
+
+    # Smooth the time series
+    smoothedClim = stackedClim.rolling(time=31, min_periods=1, center=True).mean()
+
+    # Extract the middle year and clean up
+    tmpSmooClim = smoothedClim.where(smoothedClim.year == 1, drop=True).drop_vars('year')
+    ds_smoothedClim = tmpSmooClim.rename({'time': 'dayofyear'}).assign_coords(dayofyear=ds_clim_doy.dayofyear.data)
+    
+    return ds_smoothedClim
+
+def smoothedThresh_mhw(ds, pctile=0.9, windowHalfWidth=5, smoothPercentile=True, smoothPercentileWidth=31):
+    """
+    Replicates the threshold calculation used in the marineHeatWave.py algorithm.
+    """
+    if "time" not in ds.dims:
+        print("No 'time' dimensions in the dataset")
+        return
+
+    # Create an empty DataArray to store the raw threshold results
+    thresh_coords = {k: v for k, v in ds.coords.items() if k != "time"}
+    thresh_coords["doy"] = np.arange(1, 367)
+    thresh_dims = [k for k in thresh_coords.keys()]
+    thresh = xr.DataArray(coords=thresh_coords, dims=thresh_dims)
+
+    doy = ds.time.dt.dayofyear
+    windowFullWidth = windowHalfWidth * 2 + 1
+    
+    for tt in np.arange(1, 367):
+        if tt < 366 - windowFullWidth:
+            ds_window = ds.where((doy >= tt) & (doy < tt + windowFullWidth), drop=True)
+        else:
+            ds_window = ds.where((doy >= tt) | (doy < (tt + windowFullWidth) % 365), drop=True)
+        
+        qt = ds_window.quantile(pctile, dim='time', skipna=False)
+        thresh.loc[{"doy": tt}] = qt.drop_vars('quantile')
+
+    thresh = thresh.roll(doy=windowHalfWidth, roll_coords=True)
+    
+    # --- Start of Smoothing Logic ---
+    if smoothPercentile:
+        # Stack 3 years for seamless smoothing
+        stackedThresh = xr.concat([thresh, thresh, thresh], dim='year').stack(time={'year', 'doy'})
+        
+        # Sort the stacked data to prevent issues with xarray updates
+        stackedThresh = stackedThresh.sortby(['year', 'doy'])
+        
+        # Smooth the time series
+        smoothedThresh = stackedThresh.rolling(time=smoothPercentileWidth, min_periods=1, center=True).mean()
+        
+        # Extract the middle year and clean up
+        SmoothThresh = smoothedThresh.sel(year=1).drop_vars('year').rename({'doy': 'dayofyear'})
+    else:
+        SmoothThresh = thresh.rename({'doy': 'dayofyear'})
+
+    return SmoothThresh
