@@ -1,7 +1,7 @@
 import xarray as xr
 import numpy as np
 import datetime as dt
-# import bottleneck as bn  # optional; can be injected
+import bottleneck as bn  # optional; can be injected
 import pandas as pd
 from pathlib import Path
 
@@ -205,109 +205,137 @@ def smoothedClima_mhw(obj, varname=None):
         raise ValueError("No 'time' dimension found.")
 
     clim = da.groupby("time.dayofyear").mean()
-    stacked = xr.concat([clim, clim, clim], dim='year').stack(time=['year','dayofyear']).sortby(['year','dayofyear'])
+
+    stacked = xr.concat([clim, clim, clim], dim='year') \
+                .stack(time=['year','dayofyear']) \
+                .sortby(['year','dayofyear'])
+    # PERF: ensure stacked core dim is single-chunk for rolling
+    if hasattr(stacked.data, "chunks"):
+        stacked = stacked.chunk({"time": -1})
+
     smoothed = stacked.rolling(time=31, min_periods=1, center=True).mean()
     mid_sel = smoothed.sel(year=1).drop_vars('year', errors='ignore')
     mid = mid_sel.rename({'time':'dayofyear'}) if 'time' in mid_sel.dims else mid_sel
     return mid.assign_coords(dayofyear=clim.dayofyear.data)
 
 
-def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5, smoothPercentile=True, smoothPercentileWidth=31, varname=None):
+def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
+                       smoothPercentile=True, smoothPercentileWidth=31,
+                       varname=None):
     """
     Threshold (quantile) per DOY with optional smoothing. Accepts DataArray or Dataset.
     If Dataset, pass varname or the first time-varying var is used.
     Returns a DataArray with dims (*spatial, dayofyear).
-    Robust to: missing coordinate variables on spatial dims; scalar-quantile returns.
     """
     da = _to_da(obj, varname)
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
 
-    # Use dims (not coords) so we preserve dims even when no coordinate variables are defined
     spatial_dims = [d for d in da.dims if d != "time"]
-    spatial_sizes = {d: da.sizes[d] for d in spatial_dims}
-    # Build coords: use existing coord values if present, otherwise simple range indices
-    coords = {d: (d, da.coords[d].values if d in da.coords else np.arange(spatial_sizes[d])) for d in spatial_dims}
+    coords = {d: (d, da.coords[d].values if d in da.coords else np.arange(da.sizes[d]))
+              for d in spatial_dims}
     coords["dayofyear"] = ("dayofyear", np.arange(1, 367))
 
-    # Pre-allocate output with dims (*spatial, dayofyear)
-    thresh = xr.DataArray(
-        np.full([spatial_sizes[d] for d in spatial_dims] + [366], np.nan, dtype=float),
-        coords=coords,
-        dims=spatial_dims + ["dayofyear"],
+    year = da.time.dt.year
+    doy  = da.time.dt.dayofyear
+
+    # Map to (year, doy) and sort explicitly
+    da_y_doy = (
+        da.assign_coords(year=("time", year.data), doy=("time", doy.data))
+          .set_index(time=["year", "doy"])
+          .sortby("time")
+          .unstack("time")
+          .sortby("year").sortby("doy")
+          .reindex(doy=np.arange(1, 367))
+    )
+    # PERF: make rolling axis single-chunk (and year) to avoid overlap shuffles
+    if hasattr(da_y_doy.data, "chunks"):
+        da_y_doy = da_y_doy.chunk({"year": -1, "doy": -1})
+
+    # Presence map (distinguish “date absent” vs “value NaN”)
+    ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
+                        coords={"time": da.time}, dims=["time"])
+    present = (
+        ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
+            .set_index(time=["year","doy"])
+            .sortby("time")
+            .unstack("time")
+            .sortby("year").sortby("doy")
+            .reindex(doy=np.arange(1, 367))
+    )
+    if hasattr(present.data, "chunks"):
+        present = present.chunk({"year": -1, "doy": -1})
+
+    # Circular ±halfwidth pooling via 3× concat + rolling
+    Nday = 366
+    w = 2*int(windowHalfWidth) + 1
+
+    pad_vals = xr.concat([da_y_doy, da_y_doy, da_y_doy], dim="doy")
+    pad_pres = xr.concat([present,  present,  present ], dim="doy")
+    # PERF: keep 'doy' single-chunk after concat
+    if hasattr(pad_vals.data, "chunks"):
+        pad_vals = pad_vals.chunk({"doy": -1})
+    if hasattr(pad_pres.data, "chunks"):
+        pad_pres = pad_pres.chunk({"doy": -1})
+
+    win_vals = pad_vals.rolling(doy=w, center=True, min_periods=w).construct("w")
+    win_pres = pad_pres.rolling(doy=w, center=True, min_periods=w).construct("w")
+    centre_vals = win_vals.isel(doy=slice(Nday, 2*Nday))   # year, doy, w, (*spatial)
+    centre_pres = win_pres.isel(doy=slice(Nday, 2*Nday))   # year, doy, w
+
+    # Collapse (year,w) → 'samples'
+    samples        = centre_vals.stack(samples=("year","w"))
+    present_sample = centre_pres.stack(samples=("year","w"))
+    # PERF: core dim must be single-chunk for apply_ufunc
+    samples        = samples.chunk({"samples": -1})
+    present_sample = present_sample.chunk({"samples": -1})
+
+    # Vectorized quantile (nan-ignoring here; we enforce skipna=False next)
+    def _nanquantile_linear(a, q, axis=0):
+        try:
+            return np.nanquantile(a, q, axis=axis, method="linear")
+        except TypeError:
+            return np.nanquantile(a, q, axis=axis, interpolation="linear")
+
+    q_vec = xr.apply_ufunc(
+        lambda arr: _nanquantile_linear(arr, pctile, axis=0),
+        samples,
+        input_core_dims=[["samples"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[samples.dtype],
+        keep_attrs=True,
     )
 
-    # DOY quantiles with +/- windowHalfWidth pooling
-    doy = da["time"].dt.dayofyear
-    for tt in range(1, 367):
-        lo = tt - windowHalfWidth
-        hi = tt + windowHalfWidth
-        if lo < 1 or hi > 366:
-            # wrap indices
-            idx = ((doy >= ((lo - 1) % 366) + 1) | (doy <= ((hi - 1) % 366) + 1))
-        else:
-            idx = (doy >= lo) & (doy <= hi)
+    # Emulate skipna=False: if ANY selected measurement is NaN, set output NaN
+    any_meas_nan = xr.apply_ufunc(
+        lambda val, pres: np.any(np.isnan(val) & np.isfinite(pres), axis=0),
+        samples, present_sample,
+        input_core_dims=[["samples"], ["samples"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[bool],
+    )
+    q_vec = q_vec.where(~any_meas_nan)
 
-        da_win = da.where(idx, drop=True)
-        qt = da_win.quantile(pctile, dim="time", skipna=False)
+    # Normalize dims/coords → (*spatial, dayofyear)
+    if "doy" in q_vec.dims:
+        q_vec = q_vec.rename({"doy": "dayofyear"})
+    q_vec = q_vec.assign_coords(dayofyear=np.arange(1, 367))
+    thresh = q_vec.transpose(*(spatial_dims + ["dayofyear"]) if spatial_dims else ("dayofyear",))
+    for d in spatial_dims:
+        if d not in thresh.coords:
+            thresh = thresh.assign_coords({d: coords[d][1]})
 
-        # Normalize qt to match spatial dims of 'thresh' slice
-        base = thresh.isel(dayofyear=0, drop=True)  # dims = spatial_dims
-        if isinstance(qt, xr.Dataset):
-            qt = qt.to_array().squeeze()
-        if "quantile" in qt.dims:
-            qt = qt.squeeze("quantile", drop=True)
-        if qt.ndim == 0:
-            qt = xr.full_like(base, qt.item())
-        else:
-            # Align/broadcast to base (handles dim order and size-1 dims)
-            qt = qt.broadcast_like(base)
-
-        # assign for this doy
-        thresh.loc[{"dayofyear": tt}] = qt
-
-    # Align phase (rolling window centers) as in Eric's code
-    #thresh = thresh.roll(dayofyear=windowHalfWidth, roll_coords=False)
-
+    # Smoothing (unchanged semantics) + PERF: single-chunk the stacked core dim
     if smoothPercentile:
-        stacked = xr.concat([thresh, thresh, thresh], dim="year").stack(time=["year", "dayofyear"]).sortby(["year", "dayofyear"])
-        sm = stacked.rolling(time=smoothPercentileWidth, min_periods=1, center=True).mean()
-        mid = sm.sel(year=1).drop_vars("year", errors="ignore")
-        out = mid.rename({"time": "dayofyear"}) if "time" in mid.dims else mid
-    else:
-        out = thresh
-
-    return out
-
-
-    # Pre-allocate output
-    coords = {k: v for k, v in da.coords.items() if k != "time"}
-    coords["dayofyear"] = np.arange(1, 367)
-    dims = [k for k in coords.keys()]
-    thresh = xr.DataArray(np.full([coords[d].size for d in dims], np.nan, dtype=float), coords=coords, dims=dims)
-
-    # DOY quantiles with +/- windowHalfWidth pooling
-    doy = da['time'].dt.dayofyear
-    windowFullWidth = windowHalfWidth * 2 + 1
-    for tt in range(1, 367):
-        # define window with wraparound
-        lo = tt - windowHalfWidth
-        hi = tt + windowHalfWidth
-        if lo < 1 or hi > 366:
-            # wrap indices
-            idx = ((doy >= ((lo-1) % 366) + 1) | (doy <= ((hi-1) % 366) + 1))
-        else:
-            idx = (doy >= lo) & (doy <= hi)
-        da_win = da.where(idx, drop=True)
-        qt = da_win.quantile(pctile, dim='time', skipna=False)
-        # assign for this doy
-        thresh.loc[{ 'dayofyear': tt }] = qt
-
-    # Align phase (rolling window centers) as in Eric's code
-    #thresh = thresh.roll(dayofyear=windowHalfWidth, roll_coords=False)
-
-    if smoothPercentile:
-        stacked = xr.concat([thresh, thresh, thresh], dim='year').stack(time=['year','dayofyear']).sortby(['year','dayofyear'])
+        stacked = xr.concat([thresh, thresh, thresh], dim='year') \
+                   .stack(time=['year','dayofyear']) \
+                   .sortby(['year','dayofyear'])
+        if hasattr(stacked.data, "chunks"):
+            stacked = stacked.chunk({"time": -1})   # PERF: avoid rechunk-split/merge
         sm = stacked.rolling(time=smoothPercentileWidth, min_periods=1, center=True).mean()
         mid = sm.sel(year=1).drop_vars('year', errors='ignore')
         out = mid.rename({'time':'dayofyear'}) if 'time' in mid.dims else mid
