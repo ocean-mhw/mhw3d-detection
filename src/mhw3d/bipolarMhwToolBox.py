@@ -194,7 +194,7 @@ def calculate_MHWs_metrics(ds, maxEvt=200):
 
     return xr.merge([ds_mhw, ds_mhw_more])
 
-def smoothedClima_mhw(obj, varname=None):
+def smoothedClima_mhw(obj, varname=None, smoothPercentile=True, smoothPercentileWidth=31):
     """
     Climatology (DOY) smoothed with 31-day running mean.
     Accepts DataArray or Dataset. If Dataset, pass varname or the first time-varying var is used.
@@ -206,17 +206,34 @@ def smoothedClima_mhw(obj, varname=None):
 
     clim = da.groupby("time.dayofyear").mean()
 
-    stacked = xr.concat([clim, clim, clim], dim='year') \
-                .stack(time=['year','dayofyear']) \
-                .sortby(['year','dayofyear'])
-    # PERF: ensure stacked core dim is single-chunk for rolling
-    if hasattr(stacked.data, "chunks"):
-        stacked = stacked.chunk({"time": -1})
+    # If user requests smoothing:
+    if smoothPercentile:
+        # For optimized concatenation, create doy vector with just the right amount of time steps
+        year = 1996 # Dummy year. The reference year needs to be a leap year
+        # Create a pandas datetime of 366 dayof year
+        date_doy = pd.to_datetime(clim.dayofyear - 1, unit='D', origin=f'{year}-01-01', errors='coerce')
+        # Concat the last 31 days, the whole year and the first 31 days (for datetime vector and for data)
+        time_concat = [*(date_doy[-smoothPercentileWidth:]- pd.DateOffset(years=1)), 
+                       *date_doy, 
+                       *(date_doy[:smoothPercentileWidth] + pd.DateOffset(years=1))]
+        stacked = xr.concat([clim.isel(dayofyear=slice(-smoothPercentileWidth,None)), 
+                             clim, 
+                             clim.isel(dayofyear=slice(None,smoothPercentileWidth))], dim='dayofyear') \
+                    .assign_coords({'time':('dayofyear',time_concat)}) \
+                    .swap_dims({'dayofyear':'time'})
 
-    smoothed = stacked.rolling(time=31, min_periods=1, center=True).mean()
-    mid_sel = smoothed.sel(year=1).drop_vars('year', errors='ignore')
-    mid = mid_sel.rename({'time':'dayofyear'}) if 'time' in mid_sel.dims else mid_sel
-    return mid.assign_coords(dayofyear=clim.dayofyear.data)
+        # PERF: ensure stacked core dim is single-chunk for rolling
+        if hasattr(stacked.data, "chunks"):
+            stacked = stacked.chunk({"time": -1})
+        # The actual smoothing    
+        smoothed = stacked.rolling(time=smoothPercentileWidth, min_periods=1, center=True).mean()
+        # Now extract the middle year using this little groupby trick. Another way would be to isel(doy=slice())
+        mid_sel = smoothed.groupby('time.year')[1996].swap_dims({'time':'dayofyear'}).drop_vars('time')
+        # Make sure the names are right
+        out = mid_sel.rename({'time':'dayofyear'}) if 'time' in mid_sel.dims else mid_sel
+    else: # If no smoothing
+        out = clim
+    return out.assign_coords(dayofyear=clim.dayofyear.data)
 
 
 def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
@@ -252,43 +269,44 @@ def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
     if hasattr(da_y_doy.data, "chunks"):
         da_y_doy = da_y_doy.chunk({"year": -1, "doy": -1})
 
-    # Presence map (distinguish “date absent” vs “value NaN”)
-    ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
-                        coords={"time": da.time}, dims=["time"])
-    present = (
-        ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
-            .set_index(time=["year","doy"])
-            .sortby("time")
-            .unstack("time")
-            .sortby("year").sortby("doy")
-            .reindex(doy=np.arange(1, 367))
-    )
-    if hasattr(present.data, "chunks"):
-        present = present.chunk({"year": -1, "doy": -1})
+    # # Presence map (distinguish “date absent” vs “value NaN”)
+    # ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
+    #                     coords={"time": da.time}, dims=["time"])
+    # present = (
+    #     ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
+    #         .set_index(time=["year","doy"])
+    #         .sortby("time")
+    #         .unstack("time")
+    #         .sortby("year").sortby("doy")
+    #         .reindex(doy=np.arange(1, 367))
+    # )
+    # if hasattr(present.data, "chunks"):
+    #     present = present.chunk({"year": -1, "doy": -1})
 
     # Circular ±halfwidth pooling via 3× concat + rolling
     Nday = 366
     w = 2*int(windowHalfWidth) + 1
 
-    pad_vals = xr.concat([da_y_doy, da_y_doy, da_y_doy], dim="doy")
-    pad_pres = xr.concat([present,  present,  present ], dim="doy")
+    # pad_vals = xr.concat([da_y_doy, da_y_doy, da_y_doy], dim="doy")
+    pad_vals = xr.concat([da_y_doy.isel(time=slice(-w,None)), da_y_doy, da_y_doy.isel(time=slice(None,w))], dim="doy")
+    # pad_pres = xr.concat([present,  present,  present ], dim="doy")
     # PERF: keep 'doy' single-chunk after concat
     if hasattr(pad_vals.data, "chunks"):
         pad_vals = pad_vals.chunk({"doy": -1})
-    if hasattr(pad_pres.data, "chunks"):
-        pad_pres = pad_pres.chunk({"doy": -1})
+    # if hasattr(pad_pres.data, "chunks"):
+    #     pad_pres = pad_pres.chunk({"doy": -1})
 
     win_vals = pad_vals.rolling(doy=w, center=True, min_periods=w).construct("w")
-    win_pres = pad_pres.rolling(doy=w, center=True, min_periods=w).construct("w")
+    # win_pres = pad_pres.rolling(doy=w, center=True, min_periods=w).construct("w")
     centre_vals = win_vals.isel(doy=slice(Nday, 2*Nday))   # year, doy, w, (*spatial)
-    centre_pres = win_pres.isel(doy=slice(Nday, 2*Nday))   # year, doy, w
+    # centre_pres = win_pres.isel(doy=slice(Nday, 2*Nday))   # year, doy, w
 
     # Collapse (year,w) → 'samples'
     samples        = centre_vals.stack(samples=("year","w"))
-    present_sample = centre_pres.stack(samples=("year","w"))
+    # present_sample = centre_pres.stack(samples=("year","w"))
     # PERF: core dim must be single-chunk for apply_ufunc
     samples        = samples.chunk({"samples": -1})
-    present_sample = present_sample.chunk({"samples": -1})
+    # present_sample = present_sample.chunk({"samples": -1})
 
     # Vectorized quantile (nan-ignoring here; we enforce skipna=False next)
     def _nanquantile_linear(a, q, axis=0):
@@ -308,17 +326,17 @@ def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
         keep_attrs=True,
     )
 
-    # Emulate skipna=False: if ANY selected measurement is NaN, set output NaN
-    any_meas_nan = xr.apply_ufunc(
-        lambda val, pres: np.any(np.isnan(val) & np.isfinite(pres), axis=0),
-        samples, present_sample,
-        input_core_dims=[["samples"], ["samples"]],
-        output_core_dims=[[]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[bool],
-    )
-    q_vec = q_vec.where(~any_meas_nan)
+    # # Emulate skipna=False: if ANY selected measurement is NaN, set output NaN
+    # any_meas_nan = xr.apply_ufunc(
+    #     lambda val, pres: np.any(np.isnan(val) & np.isfinite(pres), axis=0),
+    #     samples, present_sample,
+    #     input_core_dims=[["samples"], ["samples"]],
+    #     output_core_dims=[[]],
+    #     vectorize=True,
+    #     dask="parallelized",
+    #     output_dtypes=[bool],
+    # )
+    # q_vec = q_vec.where(~any_meas_nan)
 
     # Normalize dims/coords → (*spatial, dayofyear)
     if "doy" in q_vec.dims:
