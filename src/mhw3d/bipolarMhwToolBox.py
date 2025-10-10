@@ -373,3 +373,45 @@ def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
         out = thresh
 
     return out
+
+    def calculate_Severity(obj, seas, thresh, varname=None):
+        """
+        Severity, computed from temperature (`obj`), climatological seasonal cycle (`seas`)
+        and threshold (`thresh`) as computed by `smoothedClima_mhw` and `smoothedThresh_mhw`, resp.
+        The severity is defined as T_anomalies/(thresh - clim). Following this definition, the 
+        severity can easily be related to the MHW categories (see. Hobday et al. 2018, 
+        https://doi.org/10.5670/oceanog.2018.205).
+        Inputs:
+            - obj: xr.Dataset, containing the temperature [°C]
+            - seas: xr.DataArray, containing climatological seasonal cycle [°C]
+            - thresh: xr.DataArray, containing climatological threshold (0.9 percentile) [°C]
+            - varname (default: none): in case `obj` is a Dataset, need to know which variable is temp.
+        Returns a xr.Dataset with `time`, `T_anom` (temperature anomalies, °C) and `severity` (-).
+        """
+        # Convert to a dataarray if not the case.
+        da = _to_da(obj, varname)
+        if "time" not in da.dims:
+            raise ValueError("No 'time' dimension found.")
+
+        # Compute temperature anomalies
+        Tanom = da.groupby('time.dayofyear') - seas
+        Tanom = Tanom.rename('T_anom')
+        Tanom.attrs['name'] = 'Temperature_anomalies'
+        Tanom.attrs['units'] = '°C'
+        # Compute severity. Make sure the denominator is not 0
+        severity = Tanom.groupby('time.dayofyear') / (thresh - seas + 1e-9)
+        severity = severity.rename('severity')
+        severity.attrs['name'] = 'Severity'
+        severity.attrs['units'] = '-'
+        severity.attrs['description'] = 'Severity = T_anom / (thresh - clim)'
+
+        # Put them together in one dataset
+        ds_for_detection = xr.Dataset({
+            'T_anom': Tanom,
+            'severity': severity,
+            'time': da.time
+        }).drop_vars('dayofyear')
+        
+        return ds_for_detection
+
+    
