@@ -269,44 +269,43 @@ def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
     if hasattr(da_y_doy.data, "chunks"):
         da_y_doy = da_y_doy.chunk({"year": -1, "doy": -1})
 
-    # # Presence map (distinguish “date absent” vs “value NaN”)
-    # ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
-    #                     coords={"time": da.time}, dims=["time"])
-    # present = (
-    #     ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
-    #         .set_index(time=["year","doy"])
-    #         .sortby("time")
-    #         .unstack("time")
-    #         .sortby("year").sortby("doy")
-    #         .reindex(doy=np.arange(1, 367))
-    # )
-    # if hasattr(present.data, "chunks"):
-    #     present = present.chunk({"year": -1, "doy": -1})
+    # Presence map (distinguish “date absent” vs “value NaN”)
+    ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
+                        coords={"time": da.time}, dims=["time"])
+    present = (
+        ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
+            .set_index(time=["year","doy"])
+            .sortby("time")
+            .unstack("time")
+            .sortby("year").sortby("doy")
+            .reindex(doy=np.arange(1, 367))
+    )
+    if hasattr(present.data, "chunks"):
+        present = present.chunk({"year": -1, "doy": -1})
 
     # Circular ±halfwidth pooling via 3× concat + rolling
     Nday = 366
     w = 2*int(windowHalfWidth) + 1
 
-    # pad_vals = xr.concat([da_y_doy, da_y_doy, da_y_doy], dim="doy")
-    pad_vals = xr.concat([da_y_doy.isel(time=slice(-w,None)), da_y_doy, da_y_doy.isel(time=slice(None,w))], dim="doy")
-    # pad_pres = xr.concat([present,  present,  present ], dim="doy")
+    pad_vals = xr.concat([da_y_doy.isel(doy=slice(-w,None)), da_y_doy, da_y_doy.isel(doy=slice(None,w))], dim="doy")
+    pad_pres = xr.concat([present.isel(doy=slice(-w,None)), present, present.isel(doy=slice(None,w))], dim="doy")
     # PERF: keep 'doy' single-chunk after concat
     if hasattr(pad_vals.data, "chunks"):
         pad_vals = pad_vals.chunk({"doy": -1})
-    # if hasattr(pad_pres.data, "chunks"):
-    #     pad_pres = pad_pres.chunk({"doy": -1})
+    if hasattr(pad_pres.data, "chunks"):
+        pad_pres = pad_pres.chunk({"doy": -1})
 
     win_vals = pad_vals.rolling(doy=w, center=True, min_periods=w).construct("w")
-    # win_pres = pad_pres.rolling(doy=w, center=True, min_periods=w).construct("w")
-    centre_vals = win_vals.isel(doy=slice(Nday, 2*Nday))   # year, doy, w, (*spatial)
-    # centre_pres = win_pres.isel(doy=slice(Nday, 2*Nday))   # year, doy, w
+    win_pres = pad_pres.rolling(doy=w, center=True, min_periods=w).construct("w")
+    centre_vals = win_vals.isel(doy=slice(w, Nday+w))   # year, doy, w, (*spatial)
+    centre_pres = win_pres.isel(doy=slice(w, Nday+w))   # year, doy, w
 
     # Collapse (year,w) → 'samples'
     samples        = centre_vals.stack(samples=("year","w"))
-    # present_sample = centre_pres.stack(samples=("year","w"))
+    present_sample = centre_pres.stack(samples=("year","w"))
     # PERF: core dim must be single-chunk for apply_ufunc
     samples        = samples.chunk({"samples": -1})
-    # present_sample = present_sample.chunk({"samples": -1})
+    present_sample = present_sample.chunk({"samples": -1})
 
     # Vectorized quantile (nan-ignoring here; we enforce skipna=False next)
     def _nanquantile_linear(a, q, axis=0):
@@ -326,36 +325,49 @@ def smoothedThresh_mhw(obj, pctile=0.9, windowHalfWidth=5,
         keep_attrs=True,
     )
 
-    # # Emulate skipna=False: if ANY selected measurement is NaN, set output NaN
-    # any_meas_nan = xr.apply_ufunc(
-    #     lambda val, pres: np.any(np.isnan(val) & np.isfinite(pres), axis=0),
-    #     samples, present_sample,
-    #     input_core_dims=[["samples"], ["samples"]],
-    #     output_core_dims=[[]],
-    #     vectorize=True,
-    #     dask="parallelized",
-    #     output_dtypes=[bool],
-    # )
-    # q_vec = q_vec.where(~any_meas_nan)
+    # Emulate skipna=False: if ANY selected measurement is NaN, set output NaN
+    any_meas_nan = xr.apply_ufunc(
+        lambda val, pres: np.any(np.isnan(val) & np.isfinite(pres), axis=0),
+        samples, present_sample,
+        input_core_dims=[["samples"], ["samples"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[bool],
+    )
+    q_vec = q_vec.where(~any_meas_nan)
 
     # Normalize dims/coords → (*spatial, dayofyear)
     if "doy" in q_vec.dims:
         q_vec = q_vec.rename({"doy": "dayofyear"})
-    q_vec = q_vec.assign_coords(dayofyear=np.arange(1, 367))
+    q_vec = q_vec.assign_coords(dayofyear=np.arange(1, 367)) # @NEIL: is this really necessary? It doesn't seem to do anything.
     thresh = q_vec.transpose(*(spatial_dims + ["dayofyear"]) if spatial_dims else ("dayofyear",))
     for d in spatial_dims:
         if d not in thresh.coords:
             thresh = thresh.assign_coords({d: coords[d][1]})
 
-    # Smoothing (unchanged semantics) + PERF: single-chunk the stacked core dim
+    # Smoothing (optimized concat) + PERF: single-chunk the stacked core dim
     if smoothPercentile:
-        stacked = xr.concat([thresh, thresh, thresh], dim='year') \
-                   .stack(time=['year','dayofyear']) \
-                   .sortby(['year','dayofyear'])
+        # For optimized concatenation, create doy vector with just the right amount of time steps
+        year = 1996 # The reference year needs to be a leap year
+        # Create a datetime from the dayofyear for a dummy year
+        date_doy = pd.to_datetime(thresh.dayofyear - 1, unit='D', origin=f'{year}-01-01', errors='coerce')
+        # Concat the last 31 days, the whole year and the first 31 days (for datetime vector and for data)
+        time_concat = [*(date_doy[-smoothPercentileWidth:]- pd.DateOffset(years=1)), 
+                       *date_doy, 
+                       *(date_doy[:smoothPercentileWidth] + pd.DateOffset(years=1))]
+        stacked = xr.concat([thresh.isel(dayofyear=slice(-smoothPercentileWidth,None)), 
+                             thresh, 
+                             thresh.isel(dayofyear=slice(None,smoothPercentileWidth))], dim='dayofyear') \
+                   .assign_coords({'time':('dayofyear',time_concat)}) \
+                   .swap_dims({'dayofyear':'time'})
+
         if hasattr(stacked.data, "chunks"):
             stacked = stacked.chunk({"time": -1})   # PERF: avoid rechunk-split/merge
+        # The actual smoothing
         sm = stacked.rolling(time=smoothPercentileWidth, min_periods=1, center=True).mean()
-        mid = sm.sel(year=1).drop_vars('year', errors='ignore')
+        # Now extract the middle year using this little groupby trick. Another way would be to isel(doy=slice())
+        mid = sm.groupby('time.year')[1996].swap_dims({'time':'dayofyear'}).drop_vars('time')
         out = mid.rename({'time':'dayofyear'}) if 'time' in mid.dims else mid
     else:
         out = thresh
