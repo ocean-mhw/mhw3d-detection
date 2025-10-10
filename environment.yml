@@ -19,6 +19,8 @@ dependencies:
 
   # Testing
   - pytest
+  - pip:
+    - memory_profiler
 
   # Interactive development and plotting
   - jupyterlab
