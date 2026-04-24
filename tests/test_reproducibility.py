@@ -10,7 +10,7 @@ sys.path.append('tests/data/legacy/')
 import marineHeatWaves as oliver_mhw
 
 # --- Import YOUR code from the src directory ---
-from mhw3d import bipolarMhwToolBox as ben_mhw
+from mhw3d import common, legacy
 
 
 def generate_synthetic_data():
@@ -61,14 +61,14 @@ def test_ben_mhw_against_oliver_synthetic():
     # 3. PREPARE INPUT FOR THE BEN-MHW TOOLBOX
     # Your toolbox requires 'ssta' and 'severity'. We create these
     # from the reference climatology to isolate the test to event detection.
-    ssta = temp - expected_clim['seas']
-    severity = ssta / (expected_clim['thresh'] - expected_clim['seas'])
+    T_anom = temp - expected_clim['seas']
+    severity = T_anom / (expected_clim['thresh'] - expected_clim['seas'])
 
     # Create the xarray Dataset your function needs, with dummy lat/lon coords.
     # First, create a 1D dataset with only the time dimension.
     ds_input = xr.Dataset(
         data_vars={
-            'ssta': (('time',), ssta),
+            'T_anom': (('time',), T_anom),
             'severity': (('time',), severity)
         },
         coords={'time': time}
@@ -77,7 +77,7 @@ def test_ben_mhw_against_oliver_synthetic():
     ds_input = ds_input.expand_dims(['lat', 'lon'])
 
     # 4. RUN YOUR CODE
-    ds_actual_events = ben_mhw.calculate_MHWs_metrics(ds_input)
+    ds_actual_events = common.calculate_mhw_metrics(ds_input)
 
     # 5. FORMAT THE ACTUAL RESULTS FOR COMPARISON
     # Extract the event data and build a clean DataFrame.
