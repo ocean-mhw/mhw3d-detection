@@ -1,1 +1,1 @@
-from .climatology import compute_climatology, compute_threshold
+from .climatology import detrend, compute_climatology, compute_threshold

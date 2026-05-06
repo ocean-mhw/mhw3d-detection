@@ -30,6 +30,7 @@ def generate_synthetic_data():
     # Add trend
     temp += 0.2 * (time - time[0]) / (time[-1] - time[0])
     # Add noise
+    np.random.seed(42)
     temp += 0.5 * np.random.randn(len(time))
     
     # Add three MHWs

@@ -40,18 +40,60 @@ def _build_cross_year_pad(arr, w, nan_dtype=None):
     return left_pad, right_pad
 
 
-def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercentileWidth=31):
+def detrend(obj, period=None, varname=None, deg=1):
+    """
+    Remove a polynomial trend from a DataArray, fitted over a baseline period.
+
+    The trend is fit on `period` only, then evaluated and subtracted over the
+    full time range.  Use this before computing climatology/threshold when the
+    data contains a long-term trend that would otherwise inflate the threshold.
+
+    Parameters
+    ----------
+    obj : DataArray or Dataset
+    period : slice, optional
+        Time slice used to fit the trend, e.g. slice('1982', '2011').
+        If None, uses the full record.
+    varname : str, optional
+        Variable name if obj is a Dataset.
+    deg : int
+        Polynomial degree. 1 = linear trend (default).
+
+    Returns
+    -------
+    DataArray with the trend removed, same shape and coordinates as input.
+    """
+    from mhw3d.common.core import _to_da
+    da = _to_da(obj, varname)
+    if 'time' not in da.dims:
+        raise ValueError("No 'time' dimension found.")
+
+    da_fit = da.sel(time=period) if period is not None else da
+    coeffs = da_fit.polyfit('time', deg=deg)
+    coeff_da = next(iter(coeffs.data_vars.values()))
+    trend = xr.polyval(da.time, coeff_da)
+    return (da - trend).rename(da.name)
+
+
+def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercentileWidth=31,
+                        baseline_period=None):
     """
     Climatological seasonal cycle (DOY mean) with optional 31-day running-mean smoothing.
     Accepts DataArray or Dataset. Returns a DataArray with a 'dayofyear' dimension.
 
     Best-practice version: computes a clean per-DOY mean then smooths.
     Feb 29 is included naturally from actual data — no interpolation.
+
+    baseline_period : slice, optional
+        Time slice used to compute the climatology, e.g. slice('1982', '2011').
+        If None, uses the full record.
     """
     from mhw3d.common.core import _to_da
     da = _to_da(obj, varname)
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
+    if baseline_period is not None:
+        da = da.sel(time=baseline_period)
 
     clim = da.groupby("time.dayofyear").mean()
 
@@ -80,7 +122,7 @@ def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercenti
 
 def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
                       smoothPercentile=True, smoothPercentileWidth=31,
-                      varname=None):
+                      varname=None, baseline_period=None):
     """
     Threshold (quantile) per DOY with optional smoothing. Accepts DataArray or Dataset.
     Returns a DataArray with dims (*spatial, dayofyear).
@@ -89,11 +131,17 @@ def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
     with correct cross-year boundary behaviour (Jan 1 draws from Dec of previous year).
     Feb 29 is included naturally from actual data — no interpolation.
     Enforces strict skipna=False: any measured-but-NaN value in the pooling window → NaN.
+
+    baseline_period : slice, optional
+        Time slice used to compute the threshold, e.g. slice('1982', '2011').
+        If None, uses the full record.
     """
     from mhw3d.common.core import _to_da
     da = _to_da(obj, varname)
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
+    if baseline_period is not None:
+        da = da.sel(time=baseline_period)
 
     spatial_dims = [d for d in da.dims if d != "time"]
     coords = {d: (d, da.coords[d].values if d in da.coords else np.arange(da.sizes[d]))

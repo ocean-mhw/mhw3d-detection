@@ -137,7 +137,7 @@ def _smooth_doy(da, smoothPercentileWidth):
 
 
 def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercentileWidth=31,
-                        windowHalfWidth=5):
+                        windowHalfWidth=5, climatologyPeriod=(1982, 2011)):
     """
     Climatological seasonal cycle, replicating Oliver et al. (2016) exactly.
 
@@ -145,12 +145,18 @@ def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercenti
     (same pooling as the threshold) and takes the nanmean.  DOY 60 (Feb 29) is
     linearly interpolated from Feb 28 and Mar 1, exactly as Oliver does.
 
+    climatologyPeriod : (start_year, end_year) inclusive, or None to use all data.
+                        Defaults to (1982, 2011), matching the standard Hobday 2016 baseline.
+
     Returns a DataArray with a 'dayofyear' dimension.
     """
     from mhw3d.common.core import _to_da
     da = _to_da(obj, varname)
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
+    if climatologyPeriod is not None:
+        start, end = climatologyPeriod
+        da = da.sel(time=(da.time.dt.year >= start) & (da.time.dt.year <= end))
 
     spatial_dims = [d for d in da.dims if d != "time"]
 
@@ -184,7 +190,7 @@ def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercenti
 
 def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
                       smoothPercentile=True, smoothPercentileWidth=31,
-                      varname=None):
+                      varname=None, climatologyPeriod=(1982, 2011)):
     """
     Threshold (quantile) per DOY, replicating Oliver et al. (2016) exactly.
 
@@ -195,12 +201,18 @@ def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
     Enforces strict skipna=False: any measured-but-NaN value in the pooling window
     sets the threshold to NaN (conservative behaviour for gappy mooring records).
 
+    climatologyPeriod : (start_year, end_year) inclusive, or None to use all data.
+                        Defaults to (1982, 2011), matching the standard Hobday 2016 baseline.
+
     Returns a DataArray with dims (*spatial, dayofyear).
     """
     from mhw3d.common.core import _to_da
     da = _to_da(obj, varname)
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
+    if climatologyPeriod is not None:
+        start, end = climatologyPeriod
+        da = da.sel(time=(da.time.dt.year >= start) & (da.time.dt.year <= end))
 
     spatial_dims = [d for d in da.dims if d != "time"]
     coords = {d: (d, da.coords[d].values if d in da.coords else np.arange(da.sizes[d]))
