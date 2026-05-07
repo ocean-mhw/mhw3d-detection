@@ -2,6 +2,21 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 
+def _clim_doy(time):
+    """
+    Leap-year-normalized day-of-year: Feb 29 is always DOY 60, Mar 1 always DOY 61
+    in every year.  For non-leap years Python's dt.dayofyear gives Mar 1 = DOY 60;
+    this function shifts all post-Feb-28 dates in non-leap years by +1 to match
+    Oliver's internal leap-year-2012 reference calendar.
+    """
+    doy = time.dt.dayofyear
+    is_leap = (
+        (time.dt.year % 4 == 0) &
+        ((time.dt.year % 100 != 0) | (time.dt.year % 400 == 0))
+    )
+    return xr.where((~is_leap) & (doy >= 60), doy + 1, doy)
+
+
 def _to_da(obj, varname=None):
     """
     Return a DataArray from either a DataArray or Dataset.
@@ -133,18 +148,18 @@ def calculate_mhw_metrics(ds, maxEvt=200):
                 return k
         raise ValueError("Could not find a temperature-like variable with 'time' in dims.")
 
+    cdoy = _clim_doy(work['time'])
+
     if 'T_anom' not in work:
         if 'Seas' in work:
             tvar = _pick_temp_var(work)
-            doy = work['time'].dt.dayofyear
-            work['T_anom'] = work[tvar] - work['Seas'].sel(dayofyear=doy)
+            work['T_anom'] = work[tvar] - work['Seas'].sel(dayofyear=cdoy)
         else:
             raise ValueError("Missing 'T_anom' and no 'Seas' to compute it from.")
 
     if 'severity' not in work:
         if 'Thresh' in work and 'Seas' in work:
-            doy = work['time'].dt.dayofyear
-            denom = work['Thresh'].sel(dayofyear=doy) - work['Seas'].sel(dayofyear=doy)
+            denom = work['Thresh'].sel(dayofyear=cdoy) - work['Seas'].sel(dayofyear=cdoy)
             work['severity'] = work['T_anom'] / denom
         else:
             raise ValueError("Missing 'severity' and cannot compute it (need 'Thresh' and 'Seas').")
@@ -199,12 +214,16 @@ def calculate_severity(obj, seas, thresh, varname=None):
     if "time" not in da.dims:
         raise ValueError("No 'time' dimension found.")
 
-    T_anom = da.groupby('time.dayofyear') - seas
+    cdoy = _clim_doy(da.time)
+    seas_daily   = seas.sel(dayofyear=cdoy)
+    thresh_daily = thresh.sel(dayofyear=cdoy)
+
+    T_anom = da - seas_daily
     T_anom = T_anom.rename('T_anom')
     T_anom.attrs['name'] = 'Temperature_anomalies'
     T_anom.attrs['units'] = '°C'
 
-    severity = T_anom.groupby('time.dayofyear') / (thresh - seas + 1e-9)
+    severity = T_anom / (thresh_daily - seas_daily + 1e-9)
     severity = severity.rename('severity')
     severity.attrs['name'] = 'Severity'
     severity.attrs['units'] = '-'
@@ -214,4 +233,4 @@ def calculate_severity(obj, seas, thresh, varname=None):
         'T_anom': T_anom,
         'severity': severity,
         'time': da.time
-    }).drop_vars('dayofyear')
+    })

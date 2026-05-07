@@ -2,6 +2,8 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 
+from mhw3d.common.core import _clim_doy
+
 # DOY constants matching Oliver's 2012 leap-year reference
 _FEB28 = 59  # DOY 59
 _FEB29 = 60  # DOY 60
@@ -66,7 +68,7 @@ def _pool_window(da, windowHalfWidth):
     so that no extra in-memory copies are made and the dask graph stays clean.
     """
     year = da.time.dt.year
-    doy  = da.time.dt.dayofyear
+    doy  = _clim_doy(da.time)
 
     da_y_doy = (
         da.assign_coords(year=("time", year.data), doy=("time", doy.data))

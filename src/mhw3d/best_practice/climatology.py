@@ -95,7 +95,14 @@ def compute_climatology(obj, varname=None, smoothPercentile=True, smoothPercenti
     if baseline_period is not None:
         da = da.sel(time=baseline_period)
 
-    clim = da.groupby("time.dayofyear").mean()
+    from mhw3d.common.core import _clim_doy
+    cdoy = _clim_doy(da.time)
+    clim = (
+        da.assign_coords(dayofyear=("time", cdoy.values))
+          .groupby("dayofyear")
+          .mean()
+          .reindex(dayofyear=np.arange(1, 367))
+    )
 
     if smoothPercentile:
         year = 1996  # Dummy leap year for DOY → datetime conversion
@@ -148,11 +155,12 @@ def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
               for d in spatial_dims}
     coords["dayofyear"] = ("dayofyear", np.arange(1, 367))
 
+    from mhw3d.common.core import _clim_doy
     year = da.time.dt.year
-    doy  = da.time.dt.dayofyear
+    doy  = _clim_doy(da.time)
 
     da_y_doy = (
-        da.assign_coords(year=("time", year.data), doy=("time", doy.data))
+        da.assign_coords(year=("time", year.data), doy=("time", doy.values))
           .set_index(time=["year", "doy"])
           .sortby("time")
           .unstack("time")
@@ -165,7 +173,7 @@ def compute_threshold(obj, pctile=0.9, windowHalfWidth=5,
     ones = xr.DataArray(np.ones(da.sizes["time"], dtype="int8"),
                         coords={"time": da.time}, dims=["time"])
     present = (
-        ones.assign_coords(year=("time", year.data), doy=("time", doy.data))
+        ones.assign_coords(year=("time", year.data), doy=("time", doy.values))
             .set_index(time=["year", "doy"])
             .sortby("time")
             .unstack("time")
