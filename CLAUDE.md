@@ -211,15 +211,17 @@ Tracked in the open GitHub issue. In rough order:
 
 - **Oliver's DOY convention vs Python's.** Oliver maps every date to its
   position in leap year 2012 (so Mar 1 is always DOY 61, Dec 31 always DOY 366,
-  regardless of whether the actual year is a leap year). Python's
-  `time.dt.dayofyear` gives DOY 1–365 for non-leap years (Mar 1 = DOY 60,
-  Dec 31 = DOY 365). Our per-DOY output array must use Python's convention
-  so that users can index it with `ds.time.dt.dayofyear`. This means the
-  pooling window for non-leap years is systematically off by 1 DOY relative
-  to Oliver after Feb 28, causing residual climatology/threshold differences
-  of ~0.007°C near the year boundaries and ~0.03°C around Feb 29. These are
-  irreducible without breaking the API; they do not affect event detection
-  results at `atol=0.01`.
+  regardless of whether the actual year is a leap year). `_clim_doy()` in
+  `common/core.py` replicates this internally: for non-leap years it adds 1
+  to all DOYs ≥ 60, so pooling and severity indexing use Oliver's calendar.
+  The public-facing output array still uses `dayofyear = 1..366` anchored to
+  a leap year, so users can index with `ds.time.dt.dayofyear` on leap-year
+  data and get exact results. On mixed-year data a residual of ~0.01 °C
+  remains at DOYs 45–75 in both leap and non-leap years: the 31-day smoother
+  integrates pool differences from the structural NaN at DOY 60 that non-leap
+  years leave in the `(year, doy)` 2D grid. Irreducible without abandoning
+  the 2D grid design. Leap-year-only datasets agree with Oliver at
+  floating-point precision (`atol=1e-14`).
 
 - **`+ 1e-9` denominator fudge.** Present in legacy code in three
   places. Do not replicate in `best_practice` — use `xr.where` instead.
